@@ -1,9 +1,12 @@
 from sqlalchemy import create_engine, Column, Float, String, Integer
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-engine = create_engine('sqlite:///mi_base.db', echo=True)
+
+engine = create_engine('sqlite:///products.db', echo=True)
 
 Base = declarative_base()
+
+
 
 class Product(Base):
  __tablename__ = 'productos'
