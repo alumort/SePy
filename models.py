@@ -26,7 +26,7 @@ class Cart(Base):
     __tablename__ = "carritos"
     __table_args__ = {"sqlite_autoincrement": True}
     id = Column(Integer, primary_key=True, nullable=False, autoincrement=True)
-    created_at = Column(Date, default=datetime.now, nullable=False)
+    created_at = Column(Date, nullable=False)
     status = Column(String, nullable=False)
 
 class Cart_Product(Base):
