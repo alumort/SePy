@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, status, Depends
 from pydantic import BaseModel
-
-from models import Product, Session
+from datetime import date
+from models import Product, Cart, Sale, Cart_Product, Session
 
 
 app = FastAPI()
@@ -17,6 +17,13 @@ class ProductUpdate(BaseModel):
     price: float | None = None
 
 
+class CartCreate(BaseModel):
+    created_at: date
+    status: str
+
+class CartUpdate(BaseModel):
+    created_at: date | None = None
+    status: str | None = None
 
 def get_db():
     db = Session()
@@ -27,6 +34,7 @@ def get_db():
         db.close()
 
 
+# product
 
 @app.post("/productos", status_code=status.HTTP_201_CREATED)
 def create_product(
@@ -123,7 +131,6 @@ def modify_product(
     }
 
 
-
 @app.delete(
     "/productos/{id}",
     status_code=status.HTTP_204_NO_CONTENT
@@ -144,3 +151,73 @@ def delete_product(
     db.commit()
 
     return None
+
+# sale
+
+# cart
+
+
+@app.post("/carritos", status_code=status.HTTP_201_CREATED)
+def create_product(
+    cart_data: CartCreate,
+    db = Depends(get_db)
+):
+    new_cart = Cart(
+        created_at=cart_data.created_at,
+        status = cart_data.status
+    )
+
+    db.add(new_cart)
+
+    try:
+        db.commit()
+        db.refresh(new_cart)
+    except:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Error when creating a cart"
+        )
+
+    return {
+        "id": new_cart.id,
+        "created_at": new_cart.created_at,
+        "status": new_cart.status
+    }
+
+
+@app.get("/carritos")
+def list_products(db = Depends(get_db)):
+    carts = db.query(Cart).all()
+
+    return [
+        {
+            "id": c.id,
+            "created_at": c.created_at,
+            "status": c.status
+        }
+        for c in carts
+    ]
+
+
+
+@app.get("/carritos/{id}")
+def get_cart(
+    id: int,
+    db = Depends(get_db)
+):
+    cart = db.get(Cart, id)
+
+    if cart is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cart not found :("
+        )
+
+    return {
+            "id": cart.id,
+            "created_at": cart.created_at,
+            "status": cart.status
+    }
+
+# cart product
