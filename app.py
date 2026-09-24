@@ -158,7 +158,7 @@ def delete_product(
 
 
 @app.post("/carritos", status_code=status.HTTP_201_CREATED)
-def create_product(
+def create_cart(
     cart_data: CartCreate,
     db = Depends(get_db)
 ):
@@ -187,7 +187,7 @@ def create_product(
 
 
 @app.get("/carritos")
-def list_products(db = Depends(get_db)):
+def list_carts(db = Depends(get_db)):
     carts = db.query(Cart).all()
 
     return [
