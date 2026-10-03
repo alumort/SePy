@@ -146,9 +146,14 @@ def delete_product(
             status_code=404,
             detail="Product not found"
         )
-
-    db.delete(product)
-    db.commit()
+    elif product.cart_product:        
+            raise HTTPException(
+            status_code=409,
+            detail="Can't delete products inside of a cart"
+        )
+    else:
+            db.delete(product)
+            db.commit()
 
     return None
 
@@ -219,5 +224,63 @@ def get_cart(
             "created_at": cart.created_at,
             "status": cart.status
     }
+
+@app.put("/carritos/{id}")
+def update_cart(
+    id: int,
+    cart_data : CartUpdate,
+    db = Depends(get_db)
+):
+    cart = db.get(Cart, id)
+    if cart is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cart not found"
+        )
+    elif cart.sale:
+            raise HTTPException(
+            status_code=409,
+            detail="Can't edit carts that have a sale"
+        )
+    else:
+        if cart_data.created_at is not None:
+            cart.created_at = cart_data.created_at
+        if cart_data.status is not None:
+            cart.status = cart_data.status
+            
+        db.commit()
+        db.refresh(cart)
+        return {
+        "id": cart.id,
+        "created_at": cart.created_at,
+        "status": cart.status
+        }
+
+
+
+@app.delete("/carritos/{id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_cart(
+    id: int,
+    db = Depends(get_db)
+):
+    cart = db.get(Cart, id)
+
+    if cart is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cart not found"
+        )
+    elif cart.sale:
+            raise HTTPException(
+            status_code=409,
+            detail="Can't delete carts that have a sale"
+        )
+
+    else:
+            db.delete(cart)
+            db.commit()
+
+
+    return None
 
 # cart product
