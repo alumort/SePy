@@ -2,20 +2,22 @@ from fastapi import FastAPI, HTTPException, status, Depends
 from pydantic import BaseModel
 from datetime import date
 from models import Product, Cart, Sale, Cart_Product, Session
-
+from pydantic import BaseModel, Field
+from typing import Literal
 
 app = FastAPI()
 
+class CartProductCreate(BaseModel):
+    product_id: int
+    quantity: int = Field(gt=0)
 
 class ProductCreate(BaseModel):
     name: str
     price: float
 
-
 class ProductUpdate(BaseModel):
     name: str | None = None
     price: float | None = None
-
 
 class CartCreate(BaseModel):
     created_at: date
@@ -23,7 +25,12 @@ class CartCreate(BaseModel):
 
 class CartUpdate(BaseModel):
     created_at: date | None = None
-    status: str | None = None
+    status: Literal["open", "closed"] | None = None
+
+
+class SaleCreate(BaseModel):
+    cart_id: int
+
 
 def get_db():
     db = Session()
@@ -36,7 +43,7 @@ def get_db():
 
 # product
 
-@app.post("/productos", status_code=status.HTTP_201_CREATED)
+@app.post("/products", status_code=status.HTTP_201_CREATED)
 def create_product(
     product_data: ProductCreate,
     db = Depends(get_db)
@@ -65,7 +72,7 @@ def create_product(
     }
 
 
-@app.get("/productos")
+@app.get("/products")
 def list_products(db = Depends(get_db)):
     products = db.query(Product).all()
 
@@ -80,7 +87,7 @@ def list_products(db = Depends(get_db)):
 
 
 
-@app.get("/productos/{id}")
+@app.get("/products/{id}")
 def get_product(
     id: int,
     db = Depends(get_db)
@@ -101,7 +108,7 @@ def get_product(
 
 
 
-@app.put("/productos/{id}")
+@app.put("/products/{id}")
 def modify_product(
     id: int,
     product_data: ProductUpdate,
@@ -132,7 +139,7 @@ def modify_product(
 
 
 @app.delete(
-    "/productos/{id}",
+    "/products/{id}",
     status_code=status.HTTP_204_NO_CONTENT
 )
 def delete_product(
@@ -146,7 +153,7 @@ def delete_product(
             status_code=404,
             detail="Product not found"
         )
-    elif product.cart_product:        
+    elif product.cart_products:        
             raise HTTPException(
             status_code=409,
             detail="Can't delete products inside of a cart"
@@ -159,10 +166,100 @@ def delete_product(
 
 # sale
 
+@app.post("/sales", status_code=status.HTTP_201_CREATED)
+def create_sale(
+    sale_data: SaleCreate,
+    db = Depends(get_db)
+):
+    cart = db.get(Cart, sale_data.cart_id)
+
+    if cart is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cart not found"
+        )
+
+    if cart.sale:
+        raise HTTPException(
+            status_code=409,
+            detail="This cart already has a sale"
+        )
+
+    if cart.status != "closed":
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot create a sale for an open cart"
+        )
+
+    if not cart.cart_products:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot create a sale for an empty cart"
+        )
+
+    new_sale = Sale(
+        id_cart=cart.id
+    )
+
+    db.add(new_sale)
+
+    try:
+        db.commit()
+        db.refresh(new_sale)
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Error when creating a sale"
+        )
+
+    return {
+        "id": new_sale.id,
+        "cart_id": new_sale.id_cart,
+        "date": new_sale.date,
+        "time": new_sale.time
+    }
+
+
+@app.get("/sales")
+def list_sales(db = Depends(get_db)):
+    sales = db.query(Sale).all()
+
+    return [
+        {
+            "id": sale.id,
+            "cart_id": sale.id_cart,
+            "date": sale.date,
+            "time": sale.time
+        }
+        for sale in sales
+    ]
+
+
+@app.get("/sales/{id}")
+def get_sale(
+    id: int,
+    db = Depends(get_db)
+):
+    sale = db.get(Sale, id)
+
+    if sale is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Sale not found"
+        )
+
+    return {
+        "id": sale.id,
+        "cart_id": sale.id_cart,
+        "date": sale.date,
+        "time": sale.time
+    }
+
 # cart
 
 
-@app.post("/carritos", status_code=status.HTTP_201_CREATED)
+@app.post("/carts", status_code=status.HTTP_201_CREATED)
 def create_cart(
     cart_data: CartCreate,
     db = Depends(get_db)
@@ -191,7 +288,7 @@ def create_cart(
     }
 
 
-@app.get("/carritos")
+@app.get("/carts")
 def list_carts(db = Depends(get_db)):
     carts = db.query(Cart).all()
 
@@ -206,7 +303,8 @@ def list_carts(db = Depends(get_db)):
 
 
 
-@app.get("/carritos/{id}")
+
+@app.get("/carts/{id}")
 def get_cart(
     id: int,
     db = Depends(get_db)
@@ -216,49 +314,72 @@ def get_cart(
     if cart is None:
         raise HTTPException(
             status_code=404,
-            detail="Cart not found :("
+            detail="Cart not found"
         )
 
     return {
-            "id": cart.id,
-            "created_at": cart.created_at,
-            "status": cart.status
+        "id": cart.id,
+        "created_at": cart.created_at,
+        "status": cart.status,
+        "products": [
+            {
+                "product_id": cp.id_product,
+                "name": cp.product.name,
+                "price": cp.product.price,
+                "quantity": cp.quantity
+            }
+            for cp in cart.cart_products
+        ]
     }
 
-@app.put("/carritos/{id}")
+
+@app.put("/carts/{id}")
 def update_cart(
     id: int,
-    cart_data : CartUpdate,
-    db = Depends(get_db)
+    cart_data: CartUpdate,
+    db=Depends(get_db)
 ):
     cart = db.get(Cart, id)
+
     if cart is None:
         raise HTTPException(
             status_code=404,
             detail="Cart not found"
         )
-    elif cart.sale:
-            raise HTTPException(
+
+    if cart.sale:
+        raise HTTPException(
             status_code=409,
-            detail="Can't edit carts that have a sale"
+            detail="Cannot modify a cart associated with a sale"
         )
-    else:
-        if cart_data.created_at is not None:
-            cart.created_at = cart_data.created_at
-        if cart_data.status is not None:
-            cart.status = cart_data.status
-            
+
+    if cart_data.created_at is not None:
+        cart.created_at = cart_data.created_at
+
+    if cart_data.status is not None:
+        cart.status = cart_data.status
+
+    try:
         db.commit()
         db.refresh(cart)
-        return {
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Error when updating cart"
+        )
+
+    return {
         "id": cart.id,
         "created_at": cart.created_at,
         "status": cart.status
-        }
+    }
 
 
-
-@app.delete("/carritos/{id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete(
+    "/carts/{id}",
+    status_code=status.HTTP_204_NO_CONTENT
+)
 def delete_cart(
     id: int,
     db = Depends(get_db)
@@ -270,17 +391,149 @@ def delete_cart(
             status_code=404,
             detail="Cart not found"
         )
-    elif cart.sale:
-            raise HTTPException(
+
+    if cart.sale:
+        raise HTTPException(
             status_code=409,
-            detail="Can't delete carts that have a sale"
+            detail="Cannot delete a cart associated with a sale"
         )
 
-    else:
-            db.delete(cart)
-            db.commit()
+    try:
+        db.query(Cart_Product).filter_by(
+            id_cart=id
+        ).delete(synchronize_session=False)
 
+        db.delete(cart)
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Error when deleting cart"
+        )
 
     return None
 
+
 # cart product
+
+@app.post("/carts/{id}/products", status_code=status.HTTP_201_CREATED)
+def add_product_to_cart(
+    id: int,
+    product_data: CartProductCreate,
+    db=Depends(get_db)
+):
+    cart = db.get(Cart, id)
+
+    if cart is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cart not found"
+        )
+
+    if cart.status != "open":
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot modify a closed cart"
+        )
+
+    product = db.get(Product, product_data.product_id)
+
+    if product is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found"
+        )
+
+    cart_product = db.query(Cart_Product).filter_by(
+        id_cart=id,
+        id_product=product_data.product_id
+    ).first()
+
+    if cart_product:
+        cart_product.quantity += product_data.quantity
+    else:
+        cart_product = Cart_Product(
+            id_cart=id,
+            id_product=product_data.product_id,
+            quantity=product_data.quantity
+        )
+        db.add(cart_product)
+
+    try:
+        db.commit()
+        db.refresh(cart_product)
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Error when adding product to cart"
+        )
+
+    return {
+        "id": cart_product.id,
+        "product_id": cart_product.id_product,
+        "quantity": cart_product.quantity
+    }
+
+
+@app.delete(
+    "/carts/{id}/products/{product_id}",
+    status_code=status.HTTP_204_NO_CONTENT
+)
+def remove_product_from_cart(
+    id: int,
+    product_id: int,
+    db=Depends(get_db)
+):
+    cart = db.get(Cart, id)
+
+    if cart is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cart not found"
+        )
+
+    if cart.sale:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot modify a cart associated with a sale"
+        )
+
+    if cart.status != "open":
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot remove products from a closed cart"
+        )
+
+    product = db.get(Product, product_id)
+
+    if product is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found"
+        )
+
+    cart_product = db.query(Cart_Product).filter_by(
+        id_cart=id,
+        id_product=product_id
+    ).first()
+
+    if cart_product is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found in this cart"
+        )
+
+    try:
+        db.delete(cart_product)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Error when removing product from cart"
+        )
+
+    return None

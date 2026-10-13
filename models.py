@@ -8,7 +8,7 @@ Base = declarative_base()
 
 
 class Product(Base):
-    __tablename__ = "productos"
+    __tablename__ = "products"
     __table_args__ = {"sqlite_autoincrement": True}
     id = Column(Integer, primary_key=True, nullable=False, autoincrement=True)
     name = Column(String, nullable=False)
@@ -16,16 +16,16 @@ class Product(Base):
     cart_products = relationship("Cart_Product", back_populates = "product")
 
 class Sale(Base):
-    __tablename__ = "ventas"
+    __tablename__ = "sales"
     __table_args__ = {"sqlite_autoincrement": True}
     id = Column(Integer, primary_key=True, nullable=False, autoincrement=True)
     date = Column(Date, default=datetime.now, nullable=False)
     time = Column(Time, default=datetime.now, nullable=False)
-    id_cart = Column(Integer, ForeignKey("carritos.id"), nullable=False, unique=True)
+    id_cart = Column(Integer, ForeignKey("carts.id"), nullable=False, unique=True)
     cart = relationship("Cart", back_populates = "sale", uselist=False)
 
 class Cart(Base):
-    __tablename__ = "carritos"
+    __tablename__ = "carts"
     __table_args__ = {"sqlite_autoincrement": True}
     id = Column(Integer, primary_key=True, nullable=False, autoincrement=True)
     created_at = Column(Date, nullable=False)
@@ -35,11 +35,11 @@ class Cart(Base):
 
 
 class Cart_Product(Base):
-    __tablename__ = "carrito_producto"
+    __tablename__ = "cart_product"
     __table_args__ = {"sqlite_autoincrement": True}
     id = Column(Integer, primary_key=True, nullable=False, autoincrement=True)
-    id_cart = Column(Integer, ForeignKey("carritos.id"), nullable=False)
-    id_product = Column(Integer, ForeignKey("productos.id"), nullable=False)
+    id_cart = Column(Integer, ForeignKey("carts.id"), nullable=False)
+    id_product = Column(Integer, ForeignKey("products.id"), nullable=False)
     quantity = Column(Integer, nullable=False)
     product = relationship("Product", back_populates = "cart_products")
     cart = relationship("Cart", back_populates = "cart_products")
