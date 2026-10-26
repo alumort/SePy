@@ -1,28 +1,27 @@
-from fastapi import FastAPI, HTTPException, status, Depends
-from pydantic import BaseModel, ConfigDict, Field
-from typing import Literal
 import datetime
+from typing import Literal
 
-from models import Client, Product, Cart, Sale, Cart_Product, Session
+from fastapi import Depends, FastAPI, HTTPException, Query, status
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import selectinload
 
+from models import Cart, Cart_Product, Client, Product, Sale
+from models import Session as SessionLocal
 
-app = FastAPI()
+app = FastAPI(title="API de ventas")
 
-
-class CartProductCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    product_id: int
-    quantity: int = Field(gt=0)
-
+# ---------------------------------------------------------------------------
+# Schemas 
+# ---------------------------------------------------------------------------
 
 class ProductCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=100)
     price: float = Field(gt=0)
 
 
 class ProductUpdate(BaseModel):
-    name: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=100)
     price: float | None = Field(default=None, gt=0)
 
 
@@ -31,11 +30,8 @@ class ClientCreate(BaseModel):
 
 
 class ClientUpdate(BaseModel):
-    name: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=100,
-    )
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+
 
 class CartCreate(BaseModel):
     created_at: datetime.date
@@ -47,6 +43,13 @@ class CartUpdate(BaseModel):
     status: Literal["open", "closed"] | None = None
 
 
+class CartProductCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: int
+    quantity: int = Field(gt=0)
+
+
 class SaleCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -54,7 +57,6 @@ class SaleCreate(BaseModel):
     time: datetime.time
     cart_id: int
     client_id: int
-
 
 
 class SaleUpdate(BaseModel):
@@ -71,15 +73,26 @@ class SaleCartAssign(BaseModel):
 
 
 def get_db():
-    db = Session()
+    db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
 
+def sales_query(db):
+    """Query de ventas que carga carrito, productos y cliente de una vez
+    (evita hacer una consulta extra por cada venta)."""
+    return db.query(Sale).options(
+        selectinload(Sale.cart)
+        .selectinload(Cart.cart_products)
+        .selectinload(Cart_Product.product),
+        selectinload(Sale.client),
+    )
+
+
 def calculate_cart_total(cart):
-    """Calcula el total con el precio del catálogo por la cantidad."""
+    """Total del carrito: precio actual del catálogo x cantidad."""
     if cart is None:
         return 0.0
 
@@ -89,29 +102,38 @@ def calculate_cart_total(cart):
     )
     return round(total, 2)
 
+
 def calculate_client_total_spent(client):
-    total = sum(
-        calculate_cart_total(sale.cart)
-        for sale in client.sales
-    )
+    total = sum(calculate_cart_total(sale.cart) for sale in client.sales)
     return round(total, 2)
 
 
-def serialize_cart(cart):
-    products = []
+def serialize_product(product):
+    return {
+        "id": product.id,
+        "name": product.name,
+        "price": product.price,
+    }
 
-    for cp in cart.cart_products:
-        unit_price = cp.product.price
-        products.append({
+
+def serialize_client(client):
+    return {
+        "id": client.id,
+        "name": client.name,
+        "total_spent": calculate_client_total_spent(client),
+    }
+
+
+def serialize_cart(cart):
+    products = [
+        {
             "id": cp.id,
-            "product": {
-                "id": cp.product.id,
-                "name": cp.product.name,
-                "price": unit_price,
-            },
+            "product": serialize_product(cp.product),
             "quantity": cp.quantity,
-            "subtotal": round(unit_price * cp.quantity, 2),
-        })
+            "subtotal": round(cp.product.price * cp.quantity, 2),
+        }
+        for cp in cart.cart_products
+    ]
 
     return {
         "id": cart.id,
@@ -122,33 +144,29 @@ def serialize_cart(cart):
     }
 
 
-
 def serialize_sale(sale):
-    cart = sale.cart
     client = sale.client
+    cart = sale.cart
 
     return {
         "id": sale.id,
         "date": sale.date,
         "time": sale.time,
         "total_price": calculate_cart_total(cart),
-        "client": (
-            {
-                "id": client.id,
-                "name": client.name,
-            }
-            if client is not None
-            else None
-        ),
-        "cart": serialize_cart(cart) if cart is not None else None,
+        "client": {"id": client.id, "name": client.name} if client else None,
+        "cart": serialize_cart(cart) if cart else None,
     }
 
 
-def get_assignable_cart(db, cart_id, current_sale_id=None):
-    cart = db.get(Cart, cart_id)
+def get_or_404(db, model, obj_id, label):
+    obj = db.get(model, obj_id)
+    if obj is None:
+        raise HTTPException(status_code=404, detail=f"{label} not found")
+    return obj
 
-    if cart is None:
-        raise HTTPException(status_code=404, detail="Cart not found")
+
+def get_assignable_cart(db, cart_id, current_sale_id=None):
+    cart = get_or_404(db, Cart, cart_id, "Cart")
 
     # Un carrito no puede estar asociado a dos ventas.
     if cart.sale is not None and cart.sale.id != current_sale_id:
@@ -165,84 +183,70 @@ def get_assignable_cart(db, cart_id, current_sale_id=None):
 
     return cart
 
-@app.post("/products", status_code=status.HTTP_201_CREATED)
-def create_product(product_data: ProductCreate, db=Depends(get_db)):
-    new_product = Product(
-        name=product_data.name,
-        price=product_data.price,
-    )
-    db.add(new_product)
 
+def get_editable_cart(db, cart_id):
+    """Carrito que todavía se puede modificar (abierto y sin venta)."""
+    cart = get_or_404(db, Cart, cart_id, "Cart")
+
+    if cart.sale is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot modify a cart associated with a sale",
+        )
+    if cart.status != "open":
+        raise HTTPException(status_code=409, detail="Cannot modify a closed cart")
+
+    return cart
+
+
+def commit_or_raise(db, status_code, detail, *to_refresh):
+    """Hace commit; si falla, rollback y devuelve el error HTTP indicado."""
     try:
         db.commit()
-        db.refresh(new_product)
-    except Exception:
+        for obj in to_refresh:
+            db.refresh(obj)
+    except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(
-            status_code=400,
-            detail="Error when creating a product",
-        )
+        raise HTTPException(status_code=status_code, detail=detail)
 
-    return {
-        "id": new_product.id,
-        "name": new_product.name,
-        "price": new_product.price,
-    }
+
+# ---------------------------------------------------------------------------
+# Products
+# ---------------------------------------------------------------------------
+
+@app.post("/products", status_code=status.HTTP_201_CREATED)
+def create_product(product_data: ProductCreate, db=Depends(get_db)):
+    new_product = Product(name=product_data.name, price=product_data.price)
+    db.add(new_product)
+    commit_or_raise(db, 400, "Error when creating a product", new_product)
+    return serialize_product(new_product)
 
 
 @app.get("/products")
 def list_products(db=Depends(get_db)):
-    products = db.query(Product).all()
-    return [
-        {"id": p.id, "name": p.name, "price": p.price}
-        for p in products
-    ]
+    return [serialize_product(p) for p in db.query(Product).all()]
 
 
 @app.get("/products/{id}")
 def get_product(id: int, db=Depends(get_db)):
-    product = db.get(Product, id)
-    if product is None:
-        raise HTTPException(status_code=404, detail="Product not found")
-
-    return {
-        "id": product.id,
-        "name": product.name,
-        "price": product.price,
-    }
+    return serialize_product(get_or_404(db, Product, id, "Product"))
 
 
 @app.put("/products/{id}")
 def modify_product(id: int, product_data: ProductUpdate, db=Depends(get_db)):
-    product = db.get(Product, id)
-    if product is None:
-        raise HTTPException(status_code=404, detail="Product not found")
+    product = get_or_404(db, Product, id, "Product")
 
-    changes = product_data.model_dump(exclude_unset=True)
-    if "name" in changes and changes["name"] is not None:
-        product.name = changes["name"]
-    if "price" in changes and changes["price"] is not None:
-        product.price = changes["price"]
+    changes = product_data.model_dump(exclude_unset=True, exclude_none=True)
+    for field, value in changes.items():
+        setattr(product, field, value)
 
-    try:
-        db.commit()
-        db.refresh(product)
-    except Exception:
-        db.rollback()
-        raise HTTPException(status_code=400, detail="Error when updating product")
-
-    return {
-        "id": product.id,
-        "name": product.name,
-        "price": product.price,
-    }
+    commit_or_raise(db, 400, "Error when updating product", product)
+    return serialize_product(product)
 
 
 @app.delete("/products/{id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_product(id: int, db=Depends(get_db)):
-    product = db.get(Product, id)
-    if product is None:
-        raise HTTPException(status_code=404, detail="Product not found")
+    product = get_or_404(db, Product, id, "Product")
 
     if product.cart_products:
         raise HTTPException(
@@ -250,64 +254,38 @@ def delete_product(id: int, db=Depends(get_db)):
             detail="Cannot delete a product registered in a cart",
         )
 
-    try:
-        db.delete(product)
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="Could not delete product")
+    db.delete(product)
+    commit_or_raise(db, 409, "Could not delete product")
 
-    return None
 
+# ---------------------------------------------------------------------------
+# Carts
+# ---------------------------------------------------------------------------
 
 @app.post("/carts", status_code=status.HTTP_201_CREATED)
 def create_cart(cart_data: CartCreate, db=Depends(get_db)):
-    new_cart = Cart(
-        created_at=cart_data.created_at,
-        status=cart_data.status,
-    )
+    new_cart = Cart(created_at=cart_data.created_at, status=cart_data.status)
     db.add(new_cart)
-
-    try:
-        db.commit()
-        db.refresh(new_cart)
-    except Exception:
-        db.rollback()
-        raise HTTPException(status_code=400, detail="Error when creating a cart")
-
-    return {
-        "id": new_cart.id,
-        "created_at": new_cart.created_at,
-        "status": new_cart.status,
-    }
+    commit_or_raise(db, 400, "Error when creating a cart", new_cart)
+    return serialize_cart(new_cart)
 
 
 @app.get("/carts")
 def list_carts(db=Depends(get_db)):
-    carts = db.query(Cart).all()
-    return [
-        {
-            "id": cart.id,
-            "created_at": cart.created_at,
-            "status": cart.status,
-        }
-        for cart in carts
-    ]
+    carts = db.query(Cart).options(
+        selectinload(Cart.cart_products).selectinload(Cart_Product.product)
+    ).all()
+    return [serialize_cart(cart) for cart in carts]
 
 
 @app.get("/carts/{id}")
 def get_cart(id: int, db=Depends(get_db)):
-    cart = db.get(Cart, id)
-    if cart is None:
-        raise HTTPException(status_code=404, detail="Cart not found")
-    return serialize_cart(cart)
+    return serialize_cart(get_or_404(db, Cart, id, "Cart"))
 
 
 @app.put("/carts/{id}")
 def update_cart(id: int, cart_data: CartUpdate, db=Depends(get_db)):
-    cart = db.get(Cart, id)
-    if cart is None:
-        raise HTTPException(status_code=404, detail="Cart not found")
+    cart = get_or_404(db, Cart, id, "Cart")
 
     if cart.sale is not None:
         raise HTTPException(
@@ -315,7 +293,7 @@ def update_cart(id: int, cart_data: CartUpdate, db=Depends(get_db)):
             detail="Cannot modify a cart associated with a sale",
         )
 
-    changes = cart_data.model_dump(exclude_unset=True)
+    changes = cart_data.model_dump(exclude_unset=True, exclude_none=True)
 
     if cart.status == "closed" and changes.get("status") == "open":
         raise HTTPException(
@@ -323,26 +301,16 @@ def update_cart(id: int, cart_data: CartUpdate, db=Depends(get_db)):
             detail="A closed cart cannot be reopened",
         )
 
-    if "created_at" in changes and changes["created_at"] is not None:
-        cart.created_at = changes["created_at"]
-    if "status" in changes and changes["status"] is not None:
-        cart.status = changes["status"]
+    for field, value in changes.items():
+        setattr(cart, field, value)
 
-    try:
-        db.commit()
-        db.refresh(cart)
-    except Exception:
-        db.rollback()
-        raise HTTPException(status_code=400, detail="Error when updating cart")
-
+    commit_or_raise(db, 400, "Error when updating cart", cart)
     return serialize_cart(cart)
 
 
 @app.delete("/carts/{id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_cart(id: int, db=Depends(get_db)):
-    cart = db.get(Cart, id)
-    if cart is None:
-        raise HTTPException(status_code=404, detail="Cart not found")
+    cart = get_or_404(db, Cart, id, "Cart")
 
     if cart.sale is not None:
         raise HTTPException(
@@ -350,16 +318,13 @@ def delete_cart(id: int, db=Depends(get_db)):
             detail="Cannot delete a cart associated with a sale",
         )
 
-    try:
-        db.query(Cart_Product).filter_by(id_cart=id).delete()
-        db.delete(cart)
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="Could not delete cart")
+    db.delete(cart)
+    commit_or_raise(db, 409, "Could not delete cart")
 
-    return None
 
+# ---------------------------------------------------------------------------
+# Cart products
+# ---------------------------------------------------------------------------
 
 @app.post("/carts/{id}/products", status_code=status.HTTP_201_CREATED)
 def add_product_to_cart(
@@ -367,26 +332,12 @@ def add_product_to_cart(
     product_data: CartProductCreate,
     db=Depends(get_db),
 ):
-    cart = db.get(Cart, id)
-    if cart is None:
-        raise HTTPException(status_code=404, detail="Cart not found")
-
-    if cart.sale is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="Cannot modify a cart associated with a sale",
-        )
-
-    if cart.status != "open":
-        raise HTTPException(status_code=409, detail="Cannot modify a closed cart")
-
-    product = db.get(Product, product_data.product_id)
-    if product is None:
-        raise HTTPException(status_code=404, detail="Product not found")
+    get_editable_cart(db, id)
+    product = get_or_404(db, Product, product_data.product_id, "Product")
 
     cart_product = db.query(Cart_Product).filter_by(
         id_cart=id,
-        id_product=product_data.product_id,
+        id_product=product.id,
     ).first()
 
     if cart_product is not None:
@@ -394,20 +345,12 @@ def add_product_to_cart(
     else:
         cart_product = Cart_Product(
             id_cart=id,
-            id_product=product_data.product_id,
+            id_product=product.id,
             quantity=product_data.quantity,
         )
         db.add(cart_product)
 
-    try:
-        db.commit()
-        db.refresh(cart_product)
-    except Exception:
-        db.rollback()
-        raise HTTPException(
-            status_code=400,
-            detail="Error when adding product to cart",
-        )
+    commit_or_raise(db, 400, "Error when adding product to cart", cart_product)
 
     return {
         "id": cart_product.id,
@@ -423,25 +366,7 @@ def add_product_to_cart(
     status_code=status.HTTP_204_NO_CONTENT,
 )
 def remove_product_from_cart(id: int, product_id: int, db=Depends(get_db)):
-    cart = db.get(Cart, id)
-    if cart is None:
-        raise HTTPException(status_code=404, detail="Cart not found")
-
-    if cart.sale is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="Cannot modify a cart associated with a sale",
-        )
-
-    if cart.status != "open":
-        raise HTTPException(
-            status_code=409,
-            detail="Cannot remove products from a closed cart",
-        )
-
-    product = db.get(Product, product_id)
-    if product is None:
-        raise HTTPException(status_code=404, detail="Product not found")
+    get_editable_cart(db, id)
 
     cart_product = db.query(Cart_Product).filter_by(
         id_cart=id,
@@ -449,40 +374,20 @@ def remove_product_from_cart(id: int, product_id: int, db=Depends(get_db)):
     ).first()
 
     if cart_product is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Product not found in this cart",
-        )
+        raise HTTPException(status_code=404, detail="Product not found in this cart")
 
-    try:
-        db.delete(cart_product)
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise HTTPException(
-            status_code=400,
-            detail="Error when removing product from cart",
-        )
-
-    return None
+    db.delete(cart_product)
+    commit_or_raise(db, 400, "Error when removing product from cart")
 
 
-
+# ---------------------------------------------------------------------------
+# Sales
+# ---------------------------------------------------------------------------
 
 @app.post("/sales", status_code=status.HTTP_201_CREATED)
-def create_sale(
-    sale_data: SaleCreate,
-    db=Depends(get_db),
-):
+def create_sale(sale_data: SaleCreate, db=Depends(get_db)):
     cart = get_assignable_cart(db, sale_data.cart_id)
-
-    client = db.get(Client, sale_data.client_id)
-
-    if client is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Client not found",
-        )
+    client = get_or_404(db, Client, sale_data.client_id, "Client")
 
     new_sale = Sale(
         date=sale_data.date,
@@ -490,92 +395,52 @@ def create_sale(
         id_cart=cart.id,
         id_client=client.id,
     )
-
     db.add(new_sale)
-
-    try:
-        db.commit()
-        db.refresh(new_sale)
-    except Exception:
-        db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail="Could not create sale. Check cart assignment.",
-        )
-
+    commit_or_raise(
+        db, 409, "Could not create sale. Check cart assignment.", new_sale
+    )
     return serialize_sale(new_sale)
-
 
 
 @app.get("/sales")
 def list_sales(db=Depends(get_db)):
-    return [serialize_sale(sale) for sale in db.query(Sale).all()]
+    return [serialize_sale(sale) for sale in sales_query(db).all()]
 
 
-@app.get("/sales/recent?limit=5")
+@app.get("/sales/recent")
 def get_recent_sales(
-    limit: int = 10,
+    limit: int = Query(default=10, ge=1, le=100),
     db=Depends(get_db),
 ):
-    if limit < 1 or limit > 100:
-        raise HTTPException(
-            status_code=400,
-            detail="Limit must be between 1 and 100",
-        )
-
     sales = (
-        db.query(Sale)
-        .order_by(
-            Sale.date.desc(),
-            Sale.time.desc(),
-            Sale.id.desc(),
-        )
+        sales_query(db)
+        .order_by(Sale.date.desc(), Sale.time.desc(), Sale.id.desc())
         .limit(limit)
         .all()
     )
-
     return [serialize_sale(sale) for sale in sales]
 
 
 @app.get("/sales/{id}")
 def get_sale(id: int, db=Depends(get_db)):
-    sale = db.get(Sale, id)
-    if sale is None:
-        raise HTTPException(status_code=404, detail="Sale not found")
-    return serialize_sale(sale)
+    return serialize_sale(get_or_404(db, Sale, id, "Sale"))
 
 
 @app.put("/sales/{id}")
 def update_sale(id: int, sale_data: SaleUpdate, db=Depends(get_db)):
-    sale = db.get(Sale, id)
-    if sale is None:
-        raise HTTPException(status_code=404, detail="Sale not found")
+    sale = get_or_404(db, Sale, id, "Sale")
 
-    changes = sale_data.model_dump(exclude_unset=True)
-    if "date" in changes and changes["date"] is not None:
-        sale.date = changes["date"]
-    if "time" in changes and changes["time"] is not None:
-        sale.time = changes["time"]
+    changes = sale_data.model_dump(exclude_unset=True, exclude_none=True)
+    for field, value in changes.items():
+        setattr(sale, field, value)
 
-    try:
-        db.commit()
-        db.refresh(sale)
-    except Exception:
-        db.rollback()
-        raise HTTPException(status_code=400, detail="Error when updating sale")
-
+    commit_or_raise(db, 400, "Error when updating sale", sale)
     return serialize_sale(sale)
 
 
 @app.post("/sales/{id}/cart")
-def assign_cart_to_sale(
-    id: int,
-    data: SaleCartAssign,
-    db=Depends(get_db),
-):
-    sale = db.get(Sale, id)
-    if sale is None:
-        raise HTTPException(status_code=404, detail="Sale not found")
+def assign_cart_to_sale(id: int, data: SaleCartAssign, db=Depends(get_db)):
+    sale = get_or_404(db, Sale, id, "Sale")
 
     if data.cart_id is None:
         sale.id_cart = None
@@ -583,147 +448,75 @@ def assign_cart_to_sale(
         cart = get_assignable_cart(db, data.cart_id, current_sale_id=id)
         sale.id_cart = cart.id
 
-    try:
-        db.commit()
-        db.refresh(sale)
-    except Exception:
-        db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail="Could not assign or unlink cart",
-        )
-
+    commit_or_raise(db, 409, "Could not assign or unlink cart", sale)
     return serialize_sale(sale)
 
 
 @app.delete("/sales/{id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_sale(id: int, db=Depends(get_db)):
-    sale = db.get(Sale, id)
-    if sale is None:
-        raise HTTPException(status_code=404, detail="Sale not found")
+    sale = get_or_404(db, Sale, id, "Sale")
+    db.delete(sale)
+    commit_or_raise(db, 400, "Error when deleting sale")
 
-    try:
-        db.delete(sale)
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise HTTPException(status_code=400, detail="Error when deleting sale")
-
-    return None
-
-#client
 
 
 @app.post("/clients", status_code=status.HTTP_201_CREATED)
-def create_client(
-    client_data: ClientCreate,
-    db=Depends(get_db),
-):
+def create_client(client_data: ClientCreate, db=Depends(get_db)):
     new_client = Client(name=client_data.name)
     db.add(new_client)
-
-    try:
-        db.commit()
-        db.refresh(new_client)
-    except Exception:
-        db.rollback()
-        raise HTTPException(
-            status_code=400,
-            detail="Error when creating client",
-        )
-
-    return {
-        "id": new_client.id,
-        "name": new_client.name,
-    }
-
+    commit_or_raise(db, 400, "Error when creating client", new_client)
+    return serialize_client(new_client)
 
 
 @app.get("/clients")
 def list_clients(db=Depends(get_db)):
-    clients = db.query(Client).all()
-
-    return [
-        {
-            "id": client.id,
-            "name": client.name,
-            "total_spent": calculate_client_total_spent(client),
-        }
-        for client in clients
-    ]
+    clients = db.query(Client).options(
+        selectinload(Client.sales)
+        .selectinload(Sale.cart)
+        .selectinload(Cart.cart_products)
+        .selectinload(Cart_Product.product)
+    ).all()
+    return [serialize_client(client) for client in clients]
 
 
 @app.get("/clients/{id}")
 def get_client(id: int, db=Depends(get_db)):
-    client = db.get(Client, id)
-
-    if client is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Client not found",
-        )
-
-    return {
-        "id": client.id,
-        "name": client.name,
-        "total_spent": calculate_client_total_spent(client),
-    }
+    return serialize_client(get_or_404(db, Client, id, "Client"))
 
 
 @app.put("/clients/{id}")
-def update_client(
-    id: int,
-    client_data: ClientUpdate,
-    db=Depends(get_db),
-):
-    client = db.get(Client, id)
+def update_client(id: int, client_data: ClientUpdate, db=Depends(get_db)):
+    client = get_or_404(db, Client, id, "Client")
 
-    if client is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Client not found",
-        )
+    changes = client_data.model_dump(exclude_unset=True, exclude_none=True)
+    for field, value in changes.items():
+        setattr(client, field, value)
 
-    changes = client_data.model_dump(exclude_unset=True)
-
-    if "name" in changes and changes["name"] is not None:
-        client.name = changes["name"]
-
-    try:
-        db.commit()
-        db.refresh(client)
-    except Exception:
-        db.rollback()
-        raise HTTPException(
-            status_code=400,
-            detail="Error when updating client",
-        )
-
-    return {
-        "id": client.id,
-        "name": client.name,
-    }
+    commit_or_raise(db, 400, "Error when updating client", client)
+    return serialize_client(client)
 
 
 @app.get("/clients/{id}/sales")
 def get_client_sales(id: int, db=Depends(get_db)):
-    client = db.get(Client, id)
-
-    if client is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Client not found",
-        )
+    client = get_or_404(db, Client, id, "Client")
 
     sales = (
-        db.query(Sale)
+        sales_query(db)
         .filter(Sale.id_client == client.id)
-        .order_by(
-            Sale.date.desc(),
-            Sale.time.desc(),
-            Sale.id.desc(),
-        )
+        .order_by(Sale.date.desc(), Sale.time.desc(), Sale.id.desc())
         .all()
     )
-
     return [serialize_sale(sale) for sale in sales]
+
+@app.delete("/clients/{id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_client(id: int, db=Depends(get_db)):
+    client = get_or_404(db, Client, id, "Client")
+
+    if client.sales:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete a client with registered sales",
+        )
+
+    db.delete(client)
+    commit_or_raise(db, 400, "Error when deleting client")
