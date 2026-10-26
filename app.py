@@ -3,14 +3,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from typing import Literal
 import datetime
 
-from models import Product, Cart, Sale, Cart_Product, Session
+from models import Client, Product, Cart, Sale, Cart_Product, Session
 
 
 app = FastAPI()
 
 
 class CartProductCreate(BaseModel):
-    # El cliente solo puede indicar producto y cantidad, nunca el precio.
     model_config = ConfigDict(extra="forbid")
 
     product_id: int
@@ -27,6 +26,17 @@ class ProductUpdate(BaseModel):
     price: float | None = Field(default=None, gt=0)
 
 
+class ClientCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
+class ClientUpdate(BaseModel):
+    name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+    )
+
 class CartCreate(BaseModel):
     created_at: datetime.date
     status: Literal["open", "closed"] = "open"
@@ -38,16 +48,16 @@ class CartUpdate(BaseModel):
 
 
 class SaleCreate(BaseModel):
-    # No se acepta total_price: la API siempre lo calcula.
     model_config = ConfigDict(extra="forbid")
 
     date: datetime.date
     time: datetime.time
     cart_id: int
+    client_id: int
+
 
 
 class SaleUpdate(BaseModel):
-    # Solo se pueden modificar fecha y hora de la venta.
     model_config = ConfigDict(extra="forbid")
 
     date: datetime.date | None = None
@@ -55,7 +65,6 @@ class SaleUpdate(BaseModel):
 
 
 class SaleCartAssign(BaseModel):
-    # Enviar {"cart_id": null} desvincula el carrito de la venta.
     model_config = ConfigDict(extra="forbid")
 
     cart_id: int | None
@@ -77,6 +86,13 @@ def calculate_cart_total(cart):
     total = sum(
         item.product.price * item.quantity
         for item in cart.cart_products
+    )
+    return round(total, 2)
+
+def calculate_client_total_spent(client):
+    total = sum(
+        calculate_cart_total(sale.cart)
+        for sale in client.sales
     )
     return round(total, 2)
 
@@ -106,14 +122,24 @@ def serialize_cart(cart):
     }
 
 
+
 def serialize_sale(sale):
     cart = sale.cart
+    client = sale.client
 
     return {
         "id": sale.id,
         "date": sale.date,
         "time": sale.time,
         "total_price": calculate_cart_total(cart),
+        "client": (
+            {
+                "id": client.id,
+                "name": client.name,
+            }
+            if client is not None
+            else None
+        ),
         "cart": serialize_cart(cart) if cart is not None else None,
     }
 
@@ -291,7 +317,6 @@ def update_cart(id: int, cart_data: CartUpdate, db=Depends(get_db)):
 
     changes = cart_data.model_dump(exclude_unset=True)
 
-    # Los carritos cerrados no se reabren.
     if cart.status == "closed" and changes.get("status") == "open":
         raise HTTPException(
             status_code=409,
@@ -326,7 +351,6 @@ def delete_cart(id: int, db=Depends(get_db)):
         )
 
     try:
-        # Borramos las líneas antes del carrito para no depender de cascadas.
         db.query(Cart_Product).filter_by(id_cart=id).delete()
         db.delete(cart)
         db.commit()
@@ -444,15 +468,29 @@ def remove_product_from_cart(id: int, product_id: int, db=Depends(get_db)):
 
 
 
+
 @app.post("/sales", status_code=status.HTTP_201_CREATED)
-def create_sale(sale_data: SaleCreate, db=Depends(get_db)):
+def create_sale(
+    sale_data: SaleCreate,
+    db=Depends(get_db),
+):
     cart = get_assignable_cart(db, sale_data.cart_id)
+
+    client = db.get(Client, sale_data.client_id)
+
+    if client is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Client not found",
+        )
 
     new_sale = Sale(
         date=sale_data.date,
         time=sale_data.time,
         id_cart=cart.id,
+        id_client=client.id,
     )
+
     db.add(new_sale)
 
     try:
@@ -468,9 +506,35 @@ def create_sale(sale_data: SaleCreate, db=Depends(get_db)):
     return serialize_sale(new_sale)
 
 
+
 @app.get("/sales")
 def list_sales(db=Depends(get_db)):
     return [serialize_sale(sale) for sale in db.query(Sale).all()]
+
+
+@app.get("/sales/recent?limit=5")
+def get_recent_sales(
+    limit: int = 10,
+    db=Depends(get_db),
+):
+    if limit < 1 or limit > 100:
+        raise HTTPException(
+            status_code=400,
+            detail="Limit must be between 1 and 100",
+        )
+
+    sales = (
+        db.query(Sale)
+        .order_by(
+            Sale.date.desc(),
+            Sale.time.desc(),
+            Sale.id.desc(),
+        )
+        .limit(limit)
+        .all()
+    )
+
+    return [serialize_sale(sale) for sale in sales]
 
 
 @app.get("/sales/{id}")
@@ -514,7 +578,6 @@ def assign_cart_to_sale(
         raise HTTPException(status_code=404, detail="Sale not found")
 
     if data.cart_id is None:
-        # Desvincular no abre ni modifica el carrito: permanece cerrado.
         sale.id_cart = None
     else:
         cart = get_assignable_cart(db, data.cart_id, current_sale_id=id)
@@ -547,3 +610,120 @@ def delete_sale(id: int, db=Depends(get_db)):
         raise HTTPException(status_code=400, detail="Error when deleting sale")
 
     return None
+
+#client
+
+
+@app.post("/clients", status_code=status.HTTP_201_CREATED)
+def create_client(
+    client_data: ClientCreate,
+    db=Depends(get_db),
+):
+    new_client = Client(name=client_data.name)
+    db.add(new_client)
+
+    try:
+        db.commit()
+        db.refresh(new_client)
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Error when creating client",
+        )
+
+    return {
+        "id": new_client.id,
+        "name": new_client.name,
+    }
+
+
+
+@app.get("/clients")
+def list_clients(db=Depends(get_db)):
+    clients = db.query(Client).all()
+
+    return [
+        {
+            "id": client.id,
+            "name": client.name,
+            "total_spent": calculate_client_total_spent(client),
+        }
+        for client in clients
+    ]
+
+
+@app.get("/clients/{id}")
+def get_client(id: int, db=Depends(get_db)):
+    client = db.get(Client, id)
+
+    if client is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Client not found",
+        )
+
+    return {
+        "id": client.id,
+        "name": client.name,
+        "total_spent": calculate_client_total_spent(client),
+    }
+
+
+@app.put("/clients/{id}")
+def update_client(
+    id: int,
+    client_data: ClientUpdate,
+    db=Depends(get_db),
+):
+    client = db.get(Client, id)
+
+    if client is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Client not found",
+        )
+
+    changes = client_data.model_dump(exclude_unset=True)
+
+    if "name" in changes and changes["name"] is not None:
+        client.name = changes["name"]
+
+    try:
+        db.commit()
+        db.refresh(client)
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Error when updating client",
+        )
+
+    return {
+        "id": client.id,
+        "name": client.name,
+    }
+
+
+@app.get("/clients/{id}/sales")
+def get_client_sales(id: int, db=Depends(get_db)):
+    client = db.get(Client, id)
+
+    if client is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Client not found",
+        )
+
+    sales = (
+        db.query(Sale)
+        .filter(Sale.id_client == client.id)
+        .order_by(
+            Sale.date.desc(),
+            Sale.time.desc(),
+            Sale.id.desc(),
+        )
+        .all()
+    )
+
+    return [serialize_sale(sale) for sale in sales]

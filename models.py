@@ -1,4 +1,3 @@
-
 from datetime import datetime
 
 from sqlalchemy import (
@@ -44,6 +43,19 @@ class Product(Base):
     cart_products = relationship(
         "Cart_Product",
         back_populates="product",
+    )
+
+
+class Client(Base):
+    __tablename__ = "clients"
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False)
+
+    sales = relationship(
+        "Sale",
+        back_populates="client",
     )
 
 
@@ -95,6 +107,18 @@ class Sale(Base):
         back_populates="sale",
         uselist=False,
     )
+    
+    id_client = Column(
+    Integer,
+    ForeignKey("clients.id"),
+    nullable=True,
+    )
+
+    client = relationship(
+    "Client",
+    back_populates="sales",
+    )
+
 
 
 class Cart_Product(Base):
